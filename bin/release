@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# bin/release
+# Release configuration for OKR OpenTelemetry buildpack
+
+cat << 'EOF'
+---
+config_vars:
+  OTEL_SERVICE_NAME: okr-management-app
+  OTEL_SERVICE_VERSION: "1.0.0"
+  OTEL_LOG_LEVEL: info
+  OTELCOL_CONTRIB: "true"
+default_process_types:
+  otelcol: .otelcol/start-otelcol.sh
+addons: []
+EOF

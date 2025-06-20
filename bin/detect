@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# bin/detect
+
+# Detect if this buildpack should run
+# For OKR app with OpenTelemetry
+
+set -e
+
+BUILD_DIR=$1
+
+# Check for OKR app indicators
+if [[ -f "$BUILD_DIR/Gemfile" && -d "$BUILD_DIR/otelcol" ]]; then
+    # Check if this is a Rails app with OpenTelemetry
+    if grep -q "rails" "$BUILD_DIR/Gemfile" && grep -q "opentelemetry" "$BUILD_DIR/Gemfile"; then
+        echo "OKR OpenTelemetry Collector"
+        exit 0
+    fi
+fi
+
+# Check for explicit OpenTelemetry configuration
+if [[ -f "$BUILD_DIR/otelcol/config.yml" ]]; then
+    echo "OKR OpenTelemetry Collector"
+    exit 0
+fi
+
+# Not detected
+exit 1

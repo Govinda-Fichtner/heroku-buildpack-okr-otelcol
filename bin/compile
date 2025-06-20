@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# bin/compile
+# Main compilation script for OKR OpenTelemetry buildpack
+
+set -eo pipefail
+
+BUILD_DIR=$1
+CACHE_DIR=$2
+ENV_DIR=$3
+
+# Buildpack configuration
+BUILDPACK_NAME="OKR OpenTelemetry Collector"
+OTELCOL_VERSION=${OTELCOL_VERSION:-"0.95.0"}
+OTELCOL_CONTRIB=${OTELCOL_CONTRIB:-"true"}
+
+# Utility functions
+indent() {
+    sed -u 's/^/       /'
+}
+
+echo "-----> $BUILDPACK_NAME"
+
+# Determine which collector to use
+if [[ "$OTELCOL_CONTRIB" == "true" ]]; then
+    COLLECTOR_NAME="otelcol-contrib"
+    DOWNLOAD_URL="https://github.com/open-telemetry/opentelemetry-collector-contrib/releases/download/v${OTELCOL_VERSION}/otelcol-contrib_${OTELCOL_VERSION}_linux_amd64.tar.gz"
+else
+    COLLECTOR_NAME="otelcol"
+    DOWNLOAD_URL="https://github.com/open-telemetry/opentelemetry-collector/releases/download/v${OTELCOL_VERSION}/otelcol_${OTELCOL_VERSION}_linux_amd64.tar.gz"
+fi
+
+echo "       Using OpenTelemetry Collector: $COLLECTOR_NAME v$OTELCOL_VERSION" | indent
+
+# Create collector directory
+OTELCOL_DIR="$BUILD_DIR/.otelcol"
+mkdir -p "$OTELCOL_DIR"
+
+# Download collector binary if not in cache
+CACHE_FILE="$CACHE_DIR/${COLLECTOR_NAME}_${OTELCOL_VERSION}"
+if [[ ! -f "$CACHE_FILE" ]]; then
+    echo "       Downloading $COLLECTOR_NAME..." | indent
+    
+    # Create temp directory for download
+    TEMP_DIR=$(mktemp -d)
+    cd "$TEMP_DIR"
+    
+    # Download and extract
+    curl -L -o collector.tar.gz "$DOWNLOAD_URL"
+    tar -xzf collector.tar.gz
+    
+    # Find the binary (it might be named differently)
+    if [[ -f "$COLLECTOR_NAME" ]]; then
+        cp "$COLLECTOR_NAME" "$CACHE_FILE"
+    elif [[ -f "otelcol-contrib" ]]; then
+        cp "otelcol-contrib" "$CACHE_FILE"
+    elif [[ -f "otelcol" ]]; then
+        cp "otelcol" "$CACHE_FILE"
+    else
+        echo "       ERROR: Could not find collector binary" | indent
+        exit 1
+    fi
+    
+    # Cleanup
+    cd - >/dev/null
+    rm -rf "$TEMP_DIR"
+    
+    chmod +x "$CACHE_FILE"
+    echo "       Downloaded and cached $COLLECTOR_NAME" | indent
+else
+    echo "       Using cached $COLLECTOR_NAME" | indent
+fi
+
+# Copy binary to build directory
+cp "$CACHE_FILE" "$OTELCOL_DIR/otelcol"
+chmod +x "$OTELCOL_DIR/otelcol"
+
+# Copy configuration files if they exist
+if [[ -d "$BUILD_DIR/otelcol" ]]; then
+    echo "       Copying OpenTelemetry configuration..." | indent
+    cp -r "$BUILD_DIR/otelcol"/* "$OTELCOL_DIR/"
+    
+    # Make prerun script executable if it exists
+    if [[ -f "$OTELCOL_DIR/prerun.sh" ]]; then
+        chmod +x "$OTELCOL_DIR/prerun.sh"
+    fi
+else
+    echo "       No otelcol directory found, using default configuration" | indent
+    
+    # Create default configuration for OKR app
+    cat > "$OTELCOL_DIR/config.yml" << 'EOF'
+# Default OpenTelemetry Collector configuration for OKR App
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu:
+      memory:
+      disk:
+      network:
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+
+  memory_limiter:
+    limit_mib: 512
+
+  resource:
+    attributes:
+      - key: service.name
+        value: \${env:OTEL_SERVICE_NAME}
+        action: upsert
+      - key: service.version
+        value: \${env:OTEL_SERVICE_VERSION}
+        action: upsert
+
+exporters:
+  debug:
+    verbosity: basic
+
+  otlphttp:
+    endpoint: \${env:OTEL_EXPORTER_OTLP_ENDPOINT}
+    headers:
+      authorization: \${env:OTEL_EXPORTER_OTLP_HEADERS}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [debug, otlphttp]
+    
+    metrics:
+      receivers: [otlp, hostmetrics]
+      processors: [memory_limiter, resource, batch]
+      exporters: [debug, otlphttp]
+    
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [debug, otlphttp]
+
+  telemetry:
+    logs:
+      level: \${env:OTEL_LOG_LEVEL}
+EOF
+fi
+
+# Create startup script
+cat > "$OTELCOL_DIR/start-otelcol.sh" << 'EOF'
+#!/usr/bin/env bash
+# Startup script for OpenTelemetry Collector
+
+set -e
+
+OTELCOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Set default environment variables
+export OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-okr-management-app}"
+export OTEL_SERVICE_VERSION="${OTEL_SERVICE_VERSION:-1.0.0}"
+export OTEL_LOG_LEVEL="${OTEL_LOG_LEVEL:-info}"
+
+# Skip collector for certain conditions
+if [[ "$DISABLE_OTELCOL" == "true" ]]; then
+    echo "OpenTelemetry Collector disabled via DISABLE_OTELCOL"
+    exit 0
+fi
+
+# Run prerun script if it exists
+if [[ -f "$OTELCOL_DIR/prerun.sh" ]]; then
+    echo "Running OpenTelemetry prerun script..."
+    source "$OTELCOL_DIR/prerun.sh"
+    
+    # Check if prerun script disabled the collector
+    if [[ "$DISABLE_OTELCOL" == "true" ]]; then
+        echo "OpenTelemetry Collector disabled by prerun script"
+        exit 0
+    fi
+fi
+
+# Start collector in background
+echo "Starting OpenTelemetry Collector for OKR App..."
+exec "$OTELCOL_DIR/otelcol" --config="$OTELCOL_DIR/config.yml" &
+
+# Store PID for potential cleanup
+echo $! > "$OTELCOL_DIR/otelcol.pid"
+
+# Give collector time to start
+sleep 2
+
+echo "OpenTelemetry Collector started (PID: $(cat $OTELCOL_DIR/otelcol.pid))"
+EOF
+
+chmod +x "$OTELCOL_DIR/start-otelcol.sh"
+
+# Create OKR-specific metrics collection script
+cat > "$OTELCOL_DIR/okr-metrics.sh" << 'EOF'
+#!/usr/bin/env bash
+# OKR-specific custom metrics collection
+
+# This script can be extended to collect custom business metrics
+# specific to the OKR application
+
+echo "OKR custom metrics collection initialized"
+
+# Example: Could collect metrics like:
+# - Number of active objectives
+# - Average key result completion rate
+# - User engagement metrics
+# - File upload metrics
+
+# For now, this is a placeholder for future custom metrics
+EOF
+
+chmod +x "$OTELCOL_DIR/okr-metrics.sh"
+
+echo "       OpenTelemetry Collector setup complete" | indent
+echo "       Binary: $OTELCOL_DIR/otelcol" | indent
+echo "       Config: $OTELCOL_DIR/config.yml" | indent
+echo "       Startup: $OTELCOL_DIR/start-otelcol.sh" | indent
