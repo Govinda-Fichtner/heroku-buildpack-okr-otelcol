@@ -10,7 +10,7 @@ ENV_DIR=$3
 
 # Buildpack configuration
 BUILDPACK_NAME="OKR OpenTelemetry Collector"
-OTELCOL_VERSION=${OTELCOL_VERSION:-"0.114.0"}  # Updated to more recent stable version
+OTELCOL_VERSION=${OTELCOL_VERSION:-"0.128.0"}  # Latest stable version
 OTELCOL_CONTRIB=${OTELCOL_CONTRIB:-"true"}
 
 # Utility functions
@@ -23,11 +23,11 @@ echo "-----> $BUILDPACK_NAME"
 # Determine which collector to use and construct correct download URL
 if [[ "$OTELCOL_CONTRIB" == "true" ]]; then
     COLLECTOR_NAME="otelcol-contrib"
-    # Fixed URL format for contrib releases
+    # Latest contrib release URL
     DOWNLOAD_URL="https://github.com/open-telemetry/opentelemetry-collector-contrib/releases/download/v${OTELCOL_VERSION}/otelcol-contrib_${OTELCOL_VERSION}_linux_amd64.tar.gz"
 else
     COLLECTOR_NAME="otelcol"
-    # Fixed URL format for core releases  
+    # Latest core release URL
     DOWNLOAD_URL="https://github.com/open-telemetry/opentelemetry-collector/releases/download/v${OTELCOL_VERSION}/otelcol_${OTELCOL_VERSION}_linux_amd64.tar.gz"
 fi
 
@@ -40,7 +40,7 @@ mkdir -p "$OTELCOL_DIR"
 # Download collector binary if not in cache
 CACHE_FILE="$CACHE_DIR/${COLLECTOR_NAME}_${OTELCOL_VERSION}"
 if [[ ! -f "$CACHE_FILE" ]]; then
-    echo "       Downloading $COLLECTOR_NAME..." | indent
+    echo "       Downloading $COLLECTOR_NAME v$OTELCOL_VERSION..." | indent
     echo "       URL: $DOWNLOAD_URL" | indent
     
     # Create temp directory for download
@@ -50,15 +50,21 @@ if [[ ! -f "$CACHE_FILE" ]]; then
     # Download with better error handling
     if ! curl -L -f -o collector.tar.gz "$DOWNLOAD_URL"; then
         echo "       ERROR: Failed to download collector from $DOWNLOAD_URL" | indent
-        echo "       Trying alternative download method..." | indent
+        echo "       Checking if release exists..." | indent
         
-        # Try alternative URL format or fallback to working version
-        FALLBACK_VERSION="0.111.0"
-        FALLBACK_URL="https://github.com/open-telemetry/opentelemetry-collector-contrib/releases/download/v${FALLBACK_VERSION}/otelcol-contrib_${FALLBACK_VERSION}_linux_amd64.tar.gz"
-        echo "       Fallback URL: $FALLBACK_URL" | indent
-        
-        if ! curl -L -f -o collector.tar.gz "$FALLBACK_URL"; then
-            echo "       ERROR: Failed to download collector binary" | indent
+        # Check if the release exists
+        RELEASE_CHECK_URL="https://api.github.com/repos/open-telemetry/opentelemetry-collector-contrib/releases/tags/v${OTELCOL_VERSION}"
+        if curl -s "$RELEASE_CHECK_URL" | grep -q "tag_name"; then
+            echo "       Release v$OTELCOL_VERSION exists, trying alternative download..." | indent
+            # Try without the 'v' prefix or different format
+            ALT_URL="https://github.com/open-telemetry/opentelemetry-collector-contrib/releases/download/v${OTELCOL_VERSION}/otelcontribcol_${OTELCOL_VERSION}_linux_amd64.tar.gz"
+            echo "       Alternative URL: $ALT_URL" | indent
+            curl -L -f -o collector.tar.gz "$ALT_URL" || {
+                echo "       ERROR: All download attempts failed" | indent
+                exit 1
+            }
+        else
+            echo "       ERROR: Release v$OTELCOL_VERSION does not exist" | indent
             exit 1
         fi
     fi
@@ -68,7 +74,8 @@ if [[ ! -f "$CACHE_FILE" ]]; then
         echo "       ERROR: Downloaded file is not a valid gzip archive" | indent
         echo "       File info:" | indent
         file collector.tar.gz | indent
-        head -c 100 collector.tar.gz | indent
+        echo "       First 100 bytes:" | indent
+        head -c 100 collector.tar.gz | xxd | indent
         exit 1
     fi
     
@@ -78,9 +85,9 @@ if [[ ! -f "$CACHE_FILE" ]]; then
         exit 1
     fi
     
-    # Find the binary (try multiple possible names)
+    # Find the binary (try multiple possible names for v0.128.0)
     BINARY_FOUND=false
-    for binary_name in "$COLLECTOR_NAME" "otelcol-contrib" "otelcol" "otelcontribcol"; do
+    for binary_name in "otelcol-contrib" "otelcontribcol" "$COLLECTOR_NAME" "otelcol"; do
         if [[ -f "$binary_name" ]]; then
             cp "$binary_name" "$CACHE_FILE"
             BINARY_FOUND=true
@@ -101,9 +108,16 @@ if [[ ! -f "$CACHE_FILE" ]]; then
     rm -rf "$TEMP_DIR"
     
     chmod +x "$CACHE_FILE"
-    echo "       Downloaded and cached $COLLECTOR_NAME" | indent
+    echo "       Downloaded and cached $COLLECTOR_NAME v$OTELCOL_VERSION" | indent
 else
-    echo "       Using cached $COLLECTOR_NAME" | indent
+    echo "       Using cached $COLLECTOR_NAME v$OTELCOL_VERSION" | indent
+fi
+
+# Verify binary works
+if ! "$CACHE_FILE" --version >/dev/null 2>&1; then
+    echo "       WARNING: Collector binary failed version check" | indent
+else
+    echo "       Collector binary validated successfully" | indent
 fi
 
 # Copy binary to build directory
@@ -122,9 +136,9 @@ if [[ -d "$BUILD_DIR/otelcol" ]]; then
 else
     echo "       No otelcol directory found, using default configuration" | indent
     
-    # Create default configuration for OKR app
+    # Create default configuration optimized for v0.128.0
     cat > "$OTELCOL_DIR/config.yml" << 'EOF'
-# Default OpenTelemetry Collector configuration for OKR App
+# Default OpenTelemetry Collector v0.128.0 configuration for OKR App
 receivers:
   otlp:
     protocols:
@@ -136,18 +150,21 @@ receivers:
   hostmetrics:
     collection_interval: 30s
     scrapers:
-      cpu:
-      memory:
-      disk:
-      network:
+      cpu: {}
+      memory: {}
+      disk: {}
+      network: {}
+      processes: {}
 
 processors:
   batch:
-    timeout: 1s
+    timeout: 2s
     send_batch_size: 1024
+    send_batch_max_size: 2048
 
   memory_limiter:
     limit_mib: 512
+    spike_limit_mib: 128
 
   resource:
     attributes:
@@ -156,6 +173,9 @@ processors:
         action: upsert
       - key: service.version
         value: \${env:OTEL_SERVICE_VERSION}
+        action: upsert
+      - key: deployment.environment
+        value: \${env:RAILS_ENV}
         action: upsert
 
 exporters:
@@ -166,6 +186,8 @@ exporters:
     endpoint: \${env:OTEL_EXPORTER_OTLP_ENDPOINT}
     headers:
       authorization: \${env:OTEL_EXPORTER_OTLP_HEADERS}
+    compression: gzip
+    timeout: 10s
 
 service:
   pipelines:
@@ -193,7 +215,7 @@ fi
 # Create startup script
 cat > "$OTELCOL_DIR/start-otelcol.sh" << 'EOF'
 #!/usr/bin/env bash
-# Startup script for OpenTelemetry Collector
+# Startup script for OpenTelemetry Collector v0.128.0
 
 set -e
 
@@ -223,7 +245,7 @@ if [[ -f "$OTELCOL_DIR/prerun.sh" ]]; then
 fi
 
 # Start collector in background
-echo "Starting OpenTelemetry Collector for OKR App..."
+echo "Starting OpenTelemetry Collector v0.128.0 for OKR App..."
 exec "$OTELCOL_DIR/otelcol" --config="$OTELCOL_DIR/config.yml" &
 
 # Store PID for potential cleanup
@@ -240,25 +262,31 @@ chmod +x "$OTELCOL_DIR/start-otelcol.sh"
 # Create OKR-specific metrics collection script
 cat > "$OTELCOL_DIR/okr-metrics.sh" << 'EOF'
 #!/usr/bin/env bash
-# OKR-specific custom metrics collection
+# OKR-specific custom metrics collection for v0.128.0
 
-# This script can be extended to collect custom business metrics
-# specific to the OKR application
+echo "OKR custom metrics collection initialized (OpenTelemetry Collector v0.128.0)"
 
-echo "OKR custom metrics collection initialized"
+# With v0.128.0, we have access to enhanced metrics capabilities:
+# - Improved OTLP metrics processing
+# - Better resource attribute handling  
+# - Enhanced batch processing
+# - Improved memory management
 
-# Example: Could collect metrics like:
-# - Number of active objectives
-# - Average key result completion rate
-# - User engagement metrics
-# - File upload metrics
+# Future OKR business metrics:
+# - objectives_created_total
+# - objectives_completed_total  
+# - key_results_updated_total
+# - average_completion_rate
+# - user_engagement_score
+# - database_query_performance
+# - file_upload_metrics
 
-# For now, this is a placeholder for future custom metrics
+echo "Ready for OKR business metrics collection"
 EOF
 
 chmod +x "$OTELCOL_DIR/okr-metrics.sh"
 
-echo "       OpenTelemetry Collector setup complete" | indent
+echo "       OpenTelemetry Collector v$OTELCOL_VERSION setup complete" | indent
 echo "       Binary: $OTELCOL_DIR/otelcol" | indent
 echo "       Config: $OTELCOL_DIR/config.yml" | indent
 echo "       Startup: $OTELCOL_DIR/start-otelcol.sh" | indent
