@@ -23,12 +23,12 @@ echo "-----> $BUILDPACK_NAME"
 # Determine which collector to use and construct correct download URL
 if [[ "$OTELCOL_CONTRIB" == "true" ]]; then
     COLLECTOR_NAME="otelcol-contrib"
-    # Latest contrib release URL
-    DOWNLOAD_URL="https://github.com/open-telemetry/opentelemetry-collector-contrib/releases/download/v${OTELCOL_VERSION}/otelcol-contrib_${OTELCOL_VERSION}_linux_amd64.tar.gz"
+    # FIXED: Use opentelemetry-collector-releases repository for v0.128.0
+    DOWNLOAD_URL="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/otelcol-contrib_${OTELCOL_VERSION}_linux_amd64.tar.gz"
 else
     COLLECTOR_NAME="otelcol"
-    # Latest core release URL
-    DOWNLOAD_URL="https://github.com/open-telemetry/opentelemetry-collector/releases/download/v${OTELCOL_VERSION}/otelcol_${OTELCOL_VERSION}_linux_amd64.tar.gz"
+    # FIXED: Use opentelemetry-collector-releases repository for v0.128.0
+    DOWNLOAD_URL="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/otelcol_${OTELCOL_VERSION}_linux_amd64.tar.gz"
 fi
 
 echo "       Using OpenTelemetry Collector: $COLLECTOR_NAME v$OTELCOL_VERSION" | indent
@@ -52,19 +52,32 @@ if [[ ! -f "$CACHE_FILE" ]]; then
         echo "       ERROR: Failed to download collector from $DOWNLOAD_URL" | indent
         echo "       Checking if release exists..." | indent
         
-        # Check if the release exists
-        RELEASE_CHECK_URL="https://api.github.com/repos/open-telemetry/opentelemetry-collector-contrib/releases/tags/v${OTELCOL_VERSION}"
+        # Check if the release exists in the releases repository
+        RELEASE_CHECK_URL="https://api.github.com/repos/open-telemetry/opentelemetry-collector-releases/releases/tags/v${OTELCOL_VERSION}"
         if curl -s "$RELEASE_CHECK_URL" | grep -q "tag_name"; then
-            echo "       Release v$OTELCOL_VERSION exists, trying alternative download..." | indent
-            # Try without the 'v' prefix or different format
-            ALT_URL="https://github.com/open-telemetry/opentelemetry-collector-contrib/releases/download/v${OTELCOL_VERSION}/otelcontribcol_${OTELCOL_VERSION}_linux_amd64.tar.gz"
-            echo "       Alternative URL: $ALT_URL" | indent
-            curl -L -f -o collector.tar.gz "$ALT_URL" || {
+            echo "       Release v$OTELCOL_VERSION exists, trying alternative binary names..." | indent
+            
+            # Try different binary naming conventions
+            ALT_URLS=(
+                "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/otelcontribcol_${OTELCOL_VERSION}_linux_amd64.tar.gz"
+                "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/opentelemetry-collector-contrib_${OTELCOL_VERSION}_linux_amd64.tar.gz"
+            )
+            
+            for alt_url in "${ALT_URLS[@]}"; do
+                echo "       Trying: $alt_url" | indent
+                if curl -L -f -o collector.tar.gz "$alt_url"; then
+                    echo "       Download successful with alternative URL" | indent
+                    break
+                fi
+            done
+            
+            # If still no success, fail
+            if [[ ! -f "collector.tar.gz" || ! -s "collector.tar.gz" ]]; then
                 echo "       ERROR: All download attempts failed" | indent
                 exit 1
-            }
+            fi
         else
-            echo "       ERROR: Release v$OTELCOL_VERSION does not exist" | indent
+            echo "       ERROR: Release v$OTELCOL_VERSION does not exist in opentelemetry-collector-releases" | indent
             exit 1
         fi
     fi
@@ -87,7 +100,7 @@ if [[ ! -f "$CACHE_FILE" ]]; then
     
     # Find the binary (try multiple possible names for v0.128.0)
     BINARY_FOUND=false
-    for binary_name in "otelcol-contrib" "otelcontribcol" "$COLLECTOR_NAME" "otelcol"; do
+    for binary_name in "otelcol-contrib" "otelcontribcol" "$COLLECTOR_NAME" "otelcol" "opentelemetry-collector-contrib"; do
         if [[ -f "$binary_name" ]]; then
             cp "$binary_name" "$CACHE_FILE"
             BINARY_FOUND=true
